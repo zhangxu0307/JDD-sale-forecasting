@@ -1,0 +1,282 @@
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+import datetime
+import lightgbm as lgb
+#from JD.util import WMAE
+#from src.model import buildTrainModel
+#from src.util import kFoldCV
+import matplotlib as mpl
+mpl.use('Agg')
+import xgboost as xgb
+import matplotlib.pyplot as plt
+from sklearn.cross_validation import train_test_split
+from sklearn import grid_search
+from sklearn.metrics import fbeta_score, make_scorer
+from src.util import WMAE
+
+# 处理order表
+orderData = pd.read_csv("../data/t_order.csv")
+orderData["date"] = pd.to_datetime(orderData['ord_dt']) # 解析日期
+del orderData['ord_dt']
+
+# pid数目统计
+#pnum = orderData[["shop_id", "pid", "date"]].groupby(["shop_id", "date"], as_index=False).count().rename(columns={"pid":"pidnum"})
+#pUniqueNum = orderData[["shop_id", "pid", "date"]].groupby(["shop_id", "date"], as_index=False).nunique().rename(columns={"pid":"pid_unique_num"})
+del orderData["pid"]
+
+orderGroup = orderData.groupby('shop_id', as_index=True).resample('1M', on='date') #按月聚合
+
+# 月加和
+orderDataSum = orderGroup.sum()
+del orderDataSum["shop_id"]
+orderDataSum.reset_index(level=['shop_id', 'date'], inplace=True)
+
+#order = orderDataSum
+#order = pd.merge(order, pnum, how="left", on=["shop_id", "date"])
+#order = pd.merge(order, pUniqueNum, how="left", on=["shop_id", "date"])
+
+# 月平均
+orderDataMean = orderGroup.mean()
+del orderDataMean["shop_id"]
+orderDataMean.reset_index(level=['shop_id', 'date'], inplace=True)
+
+order = pd.merge(orderDataSum, orderDataMean, on=["shop_id", "date"], how="left", suffixes=["", "_mean"])
+
+# 月最大值
+orderDataMax = orderGroup.max()
+#del orderDataMax["pid"]
+del orderDataMax["shop_id"]
+del orderDataMax["date"]
+orderDataMax.reset_index(level=['shop_id', 'date'], inplace=True)
+
+order = pd.merge(order, orderDataMax, on=["shop_id", "date"], how="left", suffixes=["", "_max"])
+
+# 月最小值
+orderDataMin = orderGroup.min()
+#del orderDataMin["pid"]
+del orderDataMin["shop_id"]
+del orderDataMin["date"]
+orderDataMin.reset_index(level=['shop_id', 'date'], inplace=True)
+
+order = pd.merge(order, orderDataMin, on=["shop_id", "date"], how="left", suffixes=["", "_min"])
+
+orderDataStd = orderGroup.std()
+del orderDataStd["shop_id"]
+orderDataStd.reset_index(level=['shop_id', 'date'], inplace=True)
+
+order = pd.merge(order, orderDataStd, on=["shop_id", "date"], how="left", suffixes=["", "_std"])
+
+orderDataMedian = orderGroup.median()
+del orderDataMedian["shop_id"]
+orderDataMedian.reset_index(level=['shop_id', 'date'], inplace=True)
+
+order = pd.merge(order, orderDataMedian, on=["shop_id", "date"], how="left", suffixes=["", "_median"])
+
+order = order.fillna(order.mean()) # 填补空值
+print("order data features:", order.columns)
+print("order data num:", len(order))
+print("order table finished!")
+
+# 处理评论表
+commentData = pd.read_csv("../data/t_comment.csv")
+commentData["date"] = pd.to_datetime(commentData['create_dt']) # 解析日期
+del commentData['create_dt']
+
+commentDataGroup = commentData.groupby('shop_id', as_index=True).resample('1M', on='date')  #按月聚合
+
+# 月加和
+commentDataSum = commentDataGroup.sum()
+del commentDataSum["shop_id"]
+commentDataSum.reset_index(level=['shop_id', 'date'], inplace=True)
+
+#comment = commentDataSum
+
+# 月平均
+commentDataMean = commentDataGroup.mean()
+del commentDataMean["shop_id"]
+commentDataMean.reset_index(level=['shop_id', 'date'], inplace=True)
+
+comment = pd.merge(commentDataSum, commentDataMean, on=["shop_id", "date"], how="left", suffixes=["", "_mean"])
+
+# 月最大值
+commentDataMax = commentDataGroup.max()
+del commentDataMax["shop_id"]
+del commentDataMax["date"]
+commentDataMax.reset_index(level=['shop_id', 'date'], inplace=True)
+
+comment = pd.merge(comment, commentDataMax, on=["shop_id", "date"], how="left", suffixes=["", "_max"])
+
+# 月最小值
+commentDataMin = commentDataGroup.min()
+del commentDataMin["shop_id"]
+del commentDataMin["date"]
+commentDataMin.reset_index(level=['shop_id', 'date'], inplace=True)
+
+comment = pd.merge(comment, commentDataMin, on=["shop_id", "date"], how="left", suffixes=["", "_min"])
+
+commentDataMedian = commentDataGroup.median()
+del commentDataMedian["shop_id"]
+commentDataMedian.reset_index(level=['shop_id', 'date'], inplace=True)
+
+comment = pd.merge(comment, commentDataMedian, on=["shop_id", "date"], how="left", suffixes=["", "_median"])
+
+comment = comment.fillna(comment.mean()) # 填补空值
+print("comment data features:", comment.columns)
+print("comment data num:", len(comment))
+print("comment tabel finished!")
+
+# 处理广告表
+adsData = pd.read_csv("../data/t_ads.csv")
+adsData["date"] = pd.to_datetime(adsData['create_dt']) # 解析日期
+del adsData['create_dt']
+
+ads = adsData.groupby('shop_id', as_index=True).resample('1M', on='date').sum() #按月聚合
+del ads["shop_id"]
+ads.reset_index(level=['shop_id', 'date'], inplace=True)
+ads = ads.fillna(ads.mean())
+print("ads data features:", ads.columns)
+print("ads data num:", len(ads))
+print("ads table finished!")
+
+# 处理商品表
+productData = pd.read_csv("../data/t_product.csv")
+distinctNum = productData.groupby(by=["shop_id"])["brand", "cate"].nunique() # 统计品牌数目和种类数目
+distinctNum.reset_index(inplace=True)
+
+# 统计每个shop每月的上货数目
+productData["date"] = pd.to_datetime(productData['on_dt']) # 解析日期
+productMonth_on = productData.groupby('shop_id', as_index=True)["date", "pid"].resample('1M', on='date').count()
+del productMonth_on["date"]
+productMonth_on = productMonth_on.reset_index(level=["shop_id", "date"]).rename(columns={"pid":"on_num"})
+
+print("product data finished!")
+
+# 链接所有表
+totalData = pd.merge(order, comment, on=["shop_id", "date"], how="outer")
+totalData = pd.merge(totalData, adsData, on=["shop_id", "date"], how="outer")
+totalData = pd.merge(totalData, distinctNum, on="shop_id", how="left")
+totalData = pd.merge(totalData, productMonth_on, on=["shop_id", "date"], how="left")
+
+# 提取月份特征
+totalData["month"] = totalData["date"].apply(lambda x: x.month)
+print("total features:", totalData.columns)
+print("total data num:", len(totalData))
+
+# 链接销量表作为label
+saleData = pd.read_csv("../data/t_sales_sum.csv")
+saleData["date"] = pd.to_datetime(saleData['dt'])
+del saleData["dt"]
+train = pd.merge(saleData, totalData, on=["shop_id", "date"], how="left") # 此处左连接，表示只有saledata中八个月的数据作为训练
+print("total data shop id num:", len(totalData["shop_id"].drop_duplicates()))
+train = train.fillna(-1)
+
+# 整理train和test以及submit
+# feature_name = [ 'shop_id',  'sale_amt', 'offer_amt', 'offer_cnt',
+#        'rtn_cnt', 'rtn_amt', 'ord_cnt', 'user_cnt',
+#         #'pidnum',
+#                  # 'pid_unique_num',
+#        'bad_num',
+#        'cmmt_num', 'dis_num', 'good_num', 'mid_num',
+#         'charge', 'consume',
+#         'brand', 'cate',
+#        'on_num',
+#                  #'month'
+#                  ]
+feature_name = ['shop_id', 'sale_amt', 'offer_amt', 'offer_cnt',
+       'rtn_cnt', 'rtn_amt', 'ord_cnt', 'user_cnt',
+       'sale_amt_mean', 'offer_amt_mean', 'offer_cnt_mean', 'rtn_cnt_mean',
+       'rtn_amt_mean', 'ord_cnt_mean', 'user_cnt_mean',
+       'sale_amt_min', 'offer_amt_min', 'offer_cnt_min', 'rtn_cnt_min',
+       'rtn_amt_min', 'ord_cnt_min', 'user_cnt_min', 'sale_amt_std',
+       'offer_amt_std', 'offer_cnt_std', 'rtn_cnt_std', 'rtn_amt_std',
+       'ord_cnt_std', 'user_cnt_std', 'sale_amt_median', 'offer_amt_median',
+       'offer_cnt_median', 'rtn_cnt_median', 'rtn_amt_median',
+       'ord_cnt_median', 'user_cnt_median', 'bad_num', 'cmmt_num',
+       'dis_num', 'good_num', 'mid_num', 'bad_num_mean',
+       'cmmt_num_mean', 'dis_num_mean', 'good_num_mean', 'mid_num_mean', 'bad_num_min',
+       'cmmt_num_min', 'dis_num_min', 'good_num_min', 'mid_num_min',
+       'bad_num_median', 'cmmt_num_median', 'dis_num_median',
+       'good_num_median', 'mid_num_median', 'charge', 'consume', 'brand',
+       'cate', 'on_num', 'month']
+
+trainx = train[feature_name]
+trainy = train["sale_amt_3m"]
+
+testx = totalData[totalData["date"] == "2017-04-30"] # 4月份的数据作为测试集
+testx = testx.fillna(-1)
+testx = testx[feature_name]
+
+submit = pd.DataFrame()
+submit["shop_id"] = testx["shop_id"]
+
+trainy = np.log1p(trainy)
+
+
+
+# 网格搜索
+print("网格搜索")
+lossFunc = make_scorer(WMAE, greater_is_better=False)
+model = xgb.XGBRegressor(objective="reg:linear")
+params = {"learning_rate": [0.5, 0.1, 0.01], "max_depth": [10, 15, 20, 25], "n_estimators":[100, 150, 170, 200, 230, 250]}
+gsearch = grid_search.GridSearchCV(estimator=model, param_grid=params, scoring=lossFunc, cv=5)
+
+gsearch.fit(trainx, trainy)
+print("best param:", gsearch.best_params_)
+print("best score:", gsearch.best_score_)
+
+print("验证")
+scores = []
+k = 10
+for i in range(k):
+
+       train_x, val_x, train_y, val_y = train_test_split(trainx, trainy, test_size=1/k)
+       model = xgb.XGBRegressor(objective="reg:linear",
+                                 learning_rate=gsearch.best_params_['learning_rate'],
+                                 max_depth=gsearch.best_params_['max_depth'],
+                                 n_estimators= gsearch.best_params_['n_estimators'],
+                                 silent=True,
+                                 colsample_bytree=0.9,
+                                 )
+       model.fit(train_x, train_y, verbose=1)
+       pre = model.predict(val_x)
+       score = np.sum(np.abs(np.expm1(pre) - np.expm1(val_y)))/np.sum(np.expm1(val_y))
+       scores.append(score)
+print("valid scores:", scores)
+print("mean score:", np.mean(scores))
+
+# 测试
+print("训练预测")
+model = xgb.XGBRegressor(objective="reg:linear",
+                                 learning_rate=gsearch.best_params_['learning_rate'],
+                                 max_depth=gsearch.best_params_['max_depth'],
+                                 n_estimators=gsearch.best_params_['n_estimators'],
+                                 silent=True,
+                                 colsample_bytree=0.9,
+                                 )
+model.fit(trainx, trainy)
+result = model.predict(testx)
+submit['prediction'] = np.expm1(result)
+submit.to_csv("../xgb_result.csv", index=False)
+print("predicting finished!")
+
+
+
+
+# modelIndex = 3
+# scores = kFoldCV(trainx, trainy, modelIndex, k=5, logFlag=True)
+# print("cross validation scores:", scores)
+#
+# # 构建模型并训练
+# model = buildTrainModel(modelIndex)
+# model.fit(trainx, trainy)
+# # xgb.plot_importance(model)
+# # plt.savefig("../importance3.jpg")
+#
+# # 预测并形成提交文件
+# pred = model.predict(testx)
+# pred = np.expm1(pred)
+# submit["pred"] = pred
+# submit.to_csv("../result.csv", index=False)
+
+
